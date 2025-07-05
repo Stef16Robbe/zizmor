@@ -74,6 +74,8 @@ pub enum QueryError {
 pub struct Query<'a> {
     /// The individual top-down components of this query.
     route: Vec<Component<'a>>,
+    /// If present, keeps owned key strings alive for the lifetime of the query.
+    owned_keys: Option<Box<[String]>>,
 }
 
 impl<'a> Query<'a> {
@@ -84,7 +86,10 @@ impl<'a> Query<'a> {
         if route.is_empty() {
             None
         } else {
-            Some(Self { route })
+            Some(Self {
+                route,
+                owned_keys: None,
+            })
         }
     }
 
@@ -95,6 +100,70 @@ impl<'a> Query<'a> {
         route.truncate(self.route.len() - 1);
         Self::new(route)
     }
+
+    /// Returns the owned key strings, if any, for this query.
+    pub fn key_strs(&self) -> Option<&[String]> {
+        self.owned_keys.as_deref()
+    }
+}
+
+impl Query<'static> {
+    /// Constructs a `Query` from a JSON Pointer (RFC 6901), owning all key strings.
+    ///
+    /// Returns an error if the pointer is empty or root.
+    pub fn from_json_pointer(pointer: &str) -> Result<Self, JsonPointerError> {
+        if pointer.is_empty() || pointer == "/" {
+            return Err(JsonPointerError::EmptyPointer);
+        }
+
+        let mut owned_keys = Vec::new();
+        let mut route = Vec::new();
+
+        for part in pointer.trim_start_matches('/').split('/') {
+            let unescaped = unescape_json_pointer(part);
+            if let Ok(idx) = unescaped.parse::<usize>() {
+                route.push(Component::Index(idx));
+            } else {
+                owned_keys.push(unescaped);
+                route.push(Component::OwnedKey(owned_keys.len() - 1));
+            }
+        }
+
+        Ok(Query {
+            route,
+            owned_keys: Some(owned_keys.into_boxed_slice()),
+        })
+    }
+}
+
+/// Error type for JSON Pointer parsing.
+#[derive(Debug, Error)]
+pub enum JsonPointerError {
+    #[error("empty pointer is not allowed")]
+    /// The pointer is empty or root, which is not allowed.
+    EmptyPointer,
+}
+
+/// Unescape a single JSON Pointer reference token per RFC 6901 section 4.
+fn unescape_json_pointer(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '~' {
+            match chars.next() {
+                Some('0') => out.push('~'),
+                Some('1') => out.push('/'),
+                Some(other) => {
+                    out.push('~');
+                    out.push(other);
+                }
+                None => out.push('~'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// A builder for [`Query`] objects.
@@ -150,6 +219,9 @@ impl<'a> QueryBuilder<'a> {
 pub enum Component<'a> {
     /// A YAML key.
     Key(&'a str),
+
+    /// An owned YAML key, stored as an index into the query's owned keys.
+    OwnedKey(usize),
 
     /// An index into a YAML array.
     Index(usize),
@@ -579,7 +651,7 @@ impl Document {
     fn query_node(&self, query: &Query, mode: QueryMode) -> Result<Node, QueryError> {
         let mut focus_node = self.top_object()?;
         for component in &query.route {
-            match self.descend(&focus_node, component) {
+            match self.descend(&focus_node, component, query) {
                 Ok(next) => focus_node = next,
                 Err(e) => return Err(e),
             }
@@ -657,9 +729,14 @@ impl Document {
         Ok(focus_node)
     }
 
-    fn descend<'b>(&self, node: &Node<'b>, component: &Component) -> Result<Node<'b>, QueryError> {
-        // The cursor is assumed to start on a block_node or flow_node,
-        // which has a single child containing the inner scalar/vector
+    fn descend<'b>(
+        &self,
+        node: &Node<'b>,
+        component: &Component,
+        query: &Query,
+    ) -> Result<Node<'b>, QueryError> {
+        // The cursor is assumed to start on a block_node or flow_node,        733         &self,
+        // which has a single child containing the inner scalar/vector         734         node: &Node<'b>,
         // type we're descending through.
         let child = node.child(0).unwrap();
 
@@ -668,6 +745,16 @@ impl Document {
         if child.kind_id() == self.block_mapping_id || child.kind_id() == self.flow_mapping_id {
             match component {
                 Component::Key(key) => self.descend_mapping(&child, key),
+                Component::OwnedKey(idx) => {
+                    let key = query
+                        .owned_keys
+                        .as_ref()
+                        .and_then(|keys| keys.get(*idx))
+                        .ok_or_else(|| {
+                            QueryError::Other(format!("invalid owned key index: {idx}"))
+                        })?;
+                    self.descend_mapping(&child, key)
+                }
                 Component::Index(idx) => Err(QueryError::ExpectedList(*idx)),
             }
         } else if child.kind_id() == self.block_sequence_id
@@ -676,6 +763,16 @@ impl Document {
             match component {
                 Component::Index(idx) => self.descend_sequence(&child, *idx),
                 Component::Key(key) => Err(QueryError::ExpectedMapping(key.to_string())),
+                Component::OwnedKey(idx) => {
+                    let key = query
+                        .owned_keys
+                        .as_ref()
+                        .and_then(|keys| keys.get(*idx))
+                        .ok_or_else(|| {
+                            QueryError::Other(format!("invalid owned key index: {idx}"))
+                        })?;
+                    Err(QueryError::ExpectedMapping(key.clone()))
+                }
             }
         } else {
             Err(QueryError::UnexpectedNode(child.kind().into()))
@@ -873,6 +970,7 @@ baz:
                 Component::Index(2),
                 Component::Index(3),
             ],
+            owned_keys: None,
         };
 
         assert_eq!(
@@ -900,6 +998,7 @@ bar: # outside
         // Querying the root gives us all comments underneath it.
         let query = Query {
             route: vec![Component::Key("root")],
+            owned_keys: None,
         };
         let feature = doc.query_pretty(&query).unwrap();
         assert_eq!(
@@ -915,6 +1014,7 @@ bar: # outside
                 Component::Key("e"),
                 Component::Index(1),
             ],
+            owned_keys: None,
         };
         let feature = doc.query_pretty(&query).unwrap();
         assert_eq!(doc.feature_comments(&feature), &["# quux"]);
