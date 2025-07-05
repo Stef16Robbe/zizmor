@@ -735,8 +735,8 @@ impl Document {
         component: &Component,
         query: &Query,
     ) -> Result<Node<'b>, QueryError> {
-        // The cursor is assumed to start on a block_node or flow_node,        733         &self,
-        // which has a single child containing the inner scalar/vector         734         node: &Node<'b>,
+        // The cursor is assumed to start on a block_node or flow_node,
+        // which has a single child containing the inner scalar/vector
         // type we're descending through.
         let child = node.child(0).unwrap();
 
